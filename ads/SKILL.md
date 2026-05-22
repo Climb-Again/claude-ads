@@ -1,7 +1,7 @@
 ---
 name: ads
 description: "Multi-platform paid advertising audit and optimization skill. Analyzes Google, Meta, YouTube, LinkedIn, TikTok, Microsoft, Apple, and Amazon Ads. 250+ checks with scoring, parallel agents, industry templates, AI creative generation, attribution and server-side tracking deep dives."
-argument-hint: "audit | google | meta | youtube | linkedin | tiktok | microsoft | apple | amazon | attribution | tracking | creative | landing | budget | plan <type> | competitor | math | test | report | dna <url> | create | generate | photoshoot"
+argument-hint: "audit | google | meta | youtube | linkedin | tiktok | microsoft | apple | amazon | attribution | tracking | creative | landing | budget | optimize | plan <type> | competitor | math | test | report | dna <url> | create | generate | photoshoot"
 license: MIT
 tested_date: 2026-05-17
 tested_with: claude-code v2.x
@@ -30,6 +30,7 @@ sub-skills and 10 agents (6 audit + 4 creative).
 | `/ads creative` | Cross-platform creative quality audit |
 | `/ads landing` | Landing page quality assessment for ad campaigns |
 | `/ads budget` | Budget allocation and bidding strategy review |
+| `/ads optimize` | Google Ads IS optimizer — live API pull, 44-check analysis, weekly action plan |
 | `/ads plan <business-type>` | Strategic ad plan with industry templates |
 | `/ads apple` | Apple Ads deep analysis |
 | `/ads competitor` | Competitor ad intelligence analysis |
@@ -157,6 +158,7 @@ Display after these commands complete their full output:
 - `/ads creative` (after creative audit)
 - `/ads landing` (after landing page assessment)
 - `/ads budget` (after budget analysis)
+- `/ads optimize` (after IS optimization report)
 - `/ads plan` (after strategic plan)
 - `/ads competitor` (after competitor analysis)
 - `/ads report` (after PDF generation confirmation)
@@ -260,6 +262,7 @@ This skill orchestrates 22 specialized sub-skills:
 20. **ads-create**: Campaign concepts, copy decks, creative briefs
 21. **ads-generate**: AI image generation with pluggable providers
 22. **ads-photoshoot**: Product photography in 5 professional styles
+23. **ads-optimize**: Google Ads IS optimization — API-connected, 44-check analysis, weekly cadence via `/loop`
 
 ## Subagents
 
@@ -270,6 +273,7 @@ For parallel analysis during full audits:
 - `audit-tracking`: Conversion tracking health across all platforms
 - `audit-budget`: Budget, bidding, structure for LinkedIn, TikTok, Microsoft
 - `audit-compliance`: Compliance, settings, performance across all platforms
+- `optimize-google`: Google Ads IS optimizer — 44 checks (O01–O44), API-connected via fetch_google_ads.py, weekly IS action plan
 - `creative-strategist`: Campaign concepts from brand profile + audit results (Opus, maxTurns: 25)
 - `visual-designer`: Image generation with brand injection via generate_image.py (Sonnet, maxTurns: 30)
 - `copy-writer`: Headlines, CTAs, primary text within platform limits (Sonnet, maxTurns: 20)
