@@ -33,6 +33,8 @@ except ImportError:
     print(json.dumps({"error": "Missing deps. Run: pip install requests PyJWT cryptography"}))
     sys.exit(1)
 
+from datetime import date, timedelta
+
 API_VERSION = "v20"
 BASE_URL = f"https://googleads.googleapis.com/{API_VERSION}"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -105,6 +107,10 @@ def _headers(access_token: str, dev_token: str, manager_id: str) -> dict:
     if manager_id:
         h["login-customer-id"] = manager_id
     return h
+
+
+def _days_ago(n: int) -> str:
+    return (date.today() - timedelta(days=n)).strftime("%Y-%m-%d")
 
 
 def _search(customer_id: str, query: str, headers: dict) -> list:
@@ -183,6 +189,8 @@ def fetch_campaigns(days: int = 30) -> dict:
     try:
         token = _get_access_token(cfg["sa_info"])
         h = _headers(token, cfg["dev_token"], cfg["manager_id"])
+        start = _days_ago(days)
+        end = date.today().strftime("%Y-%m-%d")
         rows = _search(cfg["customer_id"], f"""
             SELECT
                 campaign.id,
@@ -204,7 +212,7 @@ def fetch_campaigns(days: int = 30) -> dict:
                 metrics.search_impression_share
             FROM campaign
             WHERE campaign.status != 'REMOVED'
-              AND segments.date DURING LAST_{days}_DAYS
+              AND segments.date BETWEEN '{start}' AND '{end}'
             ORDER BY metrics.cost_micros DESC
         """, h)
 
