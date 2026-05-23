@@ -134,23 +134,17 @@ Google Ads Python library (no MCP server required).
 
 **Required env vars:**
 ```
-GOOGLE_ADS_DEVELOPER_TOKEN=...
-GOOGLE_ADS_CUSTOMER_ID=191-261-1776          # or --customer-id flag
-GOOGLE_ADS_LOGIN_CUSTOMER_ID=1234567890      # MCC/manager account (digits only)
-
-# Auth — pick one:
-GOOGLE_ADS_CLIENT_ID=...                     # OAuth2
-GOOGLE_ADS_CLIENT_SECRET=...
-GOOGLE_ADS_REFRESH_TOKEN=...
-
-GOOGLE_APPLICATION_CREDENTIALS=/path/key.json  # Service account
+GOOGLE_ADS_DEVELOPER_TOKEN=...         developer token
+GOOGLE_SERVICE_ACCOUNT_EMAIL=...       service account email
+GOOGLE_PRIVATE_KEY=...                 PEM string OR full service-account JSON string
+GOOGLE_ADS_CUSTOMER_ID=191-261-1776    target account (hyphens OK)
+GOOGLE_ADS_MANAGER_CUSTOMER_ID=...     MCC account ID (digits only, optional)
 ```
 
-**Auth setup:**
-- OAuth2: use `google-ads-python` CLI to generate a refresh token, or follow
-  the guide at `ads/references/mcp-integration.md`
-- Service account: download the JSON key from GCP → IAM & Admin →
-  Service Accounts, then set `GOOGLE_APPLICATION_CREDENTIALS`
+**Getting GOOGLE_PRIVATE_KEY:**
+1. GCP Console → IAM & Admin → Service Accounts → select account → Keys → Add Key → JSON
+2. Export: `export GOOGLE_PRIVATE_KEY=$(cat key.json)` (full JSON string)
+   Or extract just the private_key field for the PEM form.
 
 **Verify auth:** `python scripts/fetch_google_ads.py --check-auth`
 

@@ -3,9 +3,9 @@
 # Last updated: April 1, 2026
 
 # Google Ads API (used by fetch_google_ads.py for live account data)
-# Auth: set GOOGLE_ADS_DEVELOPER_TOKEN + GOOGLE_ADS_REFRESH_TOKEN (OAuth2)
-#       or GOOGLE_APPLICATION_CREDENTIALS (service account JSON key)
-google-ads>=24.0.0,<26.0.0
+# Auth: GOOGLE_SERVICE_ACCOUNT_EMAIL + GOOGLE_PRIVATE_KEY (PEM or JSON)
+# No google-ads library needed — direct REST v20 + google-auth for token exchange
+google-auth>=2.29.0,<3.0.0
 
 # Core dependencies (landing page analysis, brand screenshots)
 requests>=2.32.4,<3.0.0           # CVE-2024-47081, CVE-2024-35195 fixes

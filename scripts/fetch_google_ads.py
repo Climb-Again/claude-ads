@@ -2,9 +2,8 @@
 """
 Fetch Google Ads account data for the 80-check audit.
 
-Runs GAQL queries for all audit categories (conversion tracking, wasted spend,
-account structure, keywords/QS, ads/assets, settings, bidding/budget, PMax)
-and outputs structured JSON consumed by the /ads google skill.
+Hits the Google Ads REST API v20 directly (no google-ads Python library).
+Auth uses a service account — the same pattern as the internal Express API.
 
 Usage:
     python fetch_google_ads.py
@@ -12,36 +11,31 @@ Usage:
     python fetch_google_ads.py --customer-id 191-261-1776 --output data.json
     python fetch_google_ads.py --check-auth
 
-Auth (set one method via environment variables):
+Required environment variables:
+    GOOGLE_ADS_DEVELOPER_TOKEN    developer token
+    GOOGLE_SERVICE_ACCOUNT_EMAIL  service account email
+    GOOGLE_PRIVATE_KEY            PEM string  OR  full service-account JSON string
+    GOOGLE_ADS_CUSTOMER_ID        target account (no hyphens, or 191-261-1776 style)
 
-  Option A — OAuth2 (recommended):
-    GOOGLE_ADS_DEVELOPER_TOKEN   required
-    GOOGLE_ADS_CLIENT_ID
-    GOOGLE_ADS_CLIENT_SECRET
-    GOOGLE_ADS_REFRESH_TOKEN
-    GOOGLE_ADS_LOGIN_CUSTOMER_ID  (manager/MCC account ID, digits only)
+Optional:
+    GOOGLE_ADS_MANAGER_CUSTOMER_ID  MCC/manager account ID (digits only)
 
-  Option B — Service account:
-    GOOGLE_ADS_DEVELOPER_TOKEN   required
-    GOOGLE_APPLICATION_CREDENTIALS  path to service account JSON key file
-    GOOGLE_ADS_LOGIN_CUSTOMER_ID  (manager/MCC account ID, digits only)
-
-  GOOGLE_ADS_CUSTOMER_ID  sets the default --customer-id (can override with CLI flag)
-
-Output keys:
-    meta             fetch timestamp, customer_id, date_range, errors
-    campaigns        list of campaign objects with metrics
-    ad_groups        list of ad group objects
-    keywords         deduplicated keyword list with QS and metrics
-    search_terms     top 1000 search terms by cost (last 30 days)
-    ads              RSAs and other ad types with assets
-    conversion_actions  all non-removed conversion actions
-    shared_negative_lists  shared negative keyword lists
-    campaign_negative_lists  per-campaign negative keyword count
-    asset_groups     PMax asset groups with asset counts
-    extensions       sitelinks, callouts, structured snippets per campaign
-    audiences        audience segments applied to campaigns
-    data_errors      per-query fetch failures with reasons
+Output JSON keys:
+    meta                  fetch timestamp, customer_id, date_range, error count
+    campaigns             campaign metrics + impression share
+    ad_groups             ad group structure and metrics
+    keywords              deduplicated keywords with QS and metrics
+    search_terms          top 1000 search terms by cost (last 30 days)
+    ads                   RSAs with headlines, descriptions, ad_strength
+    conversion_actions    all non-removed conversion actions
+    shared_negative_lists account-level shared negative keyword lists
+    campaign_neg_list_assignments  which lists are assigned to which campaigns
+    campaign_negative_keywords     campaign-level negative keyword criteria
+    asset_groups          PMax asset groups with per-type asset counts
+    extensions            campaign extension settings (sitelinks, callouts, etc.)
+    audiences             campaign audience segments
+    customer_match_lists  CRM-based user lists
+    data_errors           per-query failures with reasons
 """
 
 from __future__ import annotations
@@ -54,118 +48,144 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 
+import requests
+
 from url_utils import sanitize_error
 
 log = logging.getLogger(__name__)
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+_ADS_API_BASE = "https://googleads.googleapis.com/v20"
+_TOKEN_URI = "https://oauth2.googleapis.com/token"
+_ADWORDS_SCOPE = "https://www.googleapis.com/auth/adwords"
 
-def _normalise_customer_id(raw: str) -> str:
-    """Strip dashes and spaces from a customer ID string."""
+
+# ── auth ──────────────────────────────────────────────────────────────────────
+
+def _get_access_token() -> str:
+    """Obtain a short-lived OAuth2 access token via service account credentials.
+
+    Reads GOOGLE_SERVICE_ACCOUNT_EMAIL and GOOGLE_PRIVATE_KEY from env.
+    GOOGLE_PRIVATE_KEY may be:
+      - A PEM string (starts with -----BEGIN)
+      - A full service-account JSON string (starts with {)
+    """
+    from google.oauth2 import service_account
+    import google.auth.transport.requests as g_requests
+
+    sa_email = os.environ.get("GOOGLE_SERVICE_ACCOUNT_EMAIL", "").strip()
+    raw_key = os.environ.get("GOOGLE_PRIVATE_KEY", "").strip()
+
+    if not sa_email or not raw_key:
+        missing = []
+        if not sa_email:
+            missing.append("GOOGLE_SERVICE_ACCOUNT_EMAIL")
+        if not raw_key:
+            missing.append("GOOGLE_PRIVATE_KEY")
+        raise RuntimeError(
+            f"Missing env vars: {', '.join(missing)}\n\n"
+            "GOOGLE_PRIVATE_KEY should be either:\n"
+            "  • A PEM string:  -----BEGIN RSA PRIVATE KEY-----\\n...\n"
+            "  • A full service account JSON string:  {\"type\":\"service_account\",...}\n\n"
+            "Download the JSON key from GCP → IAM & Admin → Service Accounts,\n"
+            "then export it: export GOOGLE_PRIVATE_KEY=$(cat key.json)"
+        )
+
+    # Build service_account_info dict from PEM or full JSON
+    if raw_key.lstrip().startswith("{"):
+        try:
+            sa_info = json.loads(raw_key)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"GOOGLE_PRIVATE_KEY looks like JSON but failed to parse: {exc}"
+            )
+    else:
+        # PEM key — construct the minimum required dict
+        sa_info = {
+            "type": "service_account",
+            "client_email": sa_email,
+            "private_key": raw_key.replace("\\n", "\n"),
+            "token_uri": _TOKEN_URI,
+        }
+
+    creds = service_account.Credentials.from_service_account_info(
+        sa_info, scopes=[_ADWORDS_SCOPE]
+    )
+    creds.refresh(g_requests.Request())
+    return creds.token
+
+
+def _build_headers(access_token: str, manager_id: str | None = None) -> dict:
+    dev_token = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN", "").strip()
+    if not dev_token:
+        raise RuntimeError("GOOGLE_ADS_DEVELOPER_TOKEN not set.")
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "developer-token": dev_token,
+        "Content-Type": "application/json",
+    }
+    if manager_id:
+        headers["login-customer-id"] = manager_id.replace("-", "")
+    return headers
+
+
+def _normalise_id(raw: str) -> str:
     return raw.replace("-", "").replace(" ", "").strip()
 
 
-def _build_client(login_customer_id: str | None = None):
-    """Build GoogleAdsClient from environment variables.
+# ── REST query runner ─────────────────────────────────────────────────────────
 
-    Tries OAuth2 first; falls back to service account via
-    GOOGLE_APPLICATION_CREDENTIALS.  Raises RuntimeError with actionable
-    guidance if neither set of credentials is found.
-    """
-    try:
-        from google.ads.googleads.client import GoogleAdsClient
-    except ImportError:
-        raise RuntimeError(
-            "google-ads library not installed. Run: pip install google-ads"
-        )
-
-    dev_token = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN", "").strip()
-    if not dev_token:
-        raise RuntimeError(
-            "GOOGLE_ADS_DEVELOPER_TOKEN not set. "
-            "Export it before running this script."
-        )
-
-    # Normalise login_customer_id (strip dashes if present)
-    env_login = os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "").strip()
-    if not login_customer_id and env_login:
-        login_customer_id = _normalise_customer_id(env_login)
-
-    # ── Option A: OAuth2 ──────────────────────────────────────────────────
-    client_id = os.environ.get("GOOGLE_ADS_CLIENT_ID", "").strip()
-    client_secret = os.environ.get("GOOGLE_ADS_CLIENT_SECRET", "").strip()
-    refresh_token = os.environ.get("GOOGLE_ADS_REFRESH_TOKEN", "").strip()
-
-    if client_id and client_secret and refresh_token:
-        config: dict[str, Any] = {
-            "developer_token": dev_token,
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "refresh_token": refresh_token,
-            "use_proto_plus": True,
-        }
-        if login_customer_id:
-            config["login_customer_id"] = login_customer_id
-        return GoogleAdsClient.load_from_dict(config)
-
-    # ── Option B: Service account ─────────────────────────────────────────
-    key_file = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-    if key_file:
-        if not os.path.isfile(key_file):
-            raise RuntimeError(
-                f"GOOGLE_APPLICATION_CREDENTIALS points to '{key_file}' "
-                "but that file does not exist."
-            )
-        config = {
-            "developer_token": dev_token,
-            "json_key_file_path": key_file,
-            "use_proto_plus": True,
-        }
-        impersonate = os.environ.get("GOOGLE_SERVICE_ACCOUNT_EMAIL", "").strip()
-        if impersonate:
-            config["impersonated_email"] = impersonate
-        if login_customer_id:
-            config["login_customer_id"] = login_customer_id
-        return GoogleAdsClient.load_from_dict(config)
-
-    # ── Neither found ─────────────────────────────────────────────────────
-    raise RuntimeError(
-        "No Google Ads credentials found. Set one of:\n\n"
-        "  OAuth2 (recommended):\n"
-        "    GOOGLE_ADS_CLIENT_ID=...\n"
-        "    GOOGLE_ADS_CLIENT_SECRET=...\n"
-        "    GOOGLE_ADS_REFRESH_TOKEN=...\n\n"
-        "  Service account:\n"
-        "    GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json\n\n"
-        "Both methods also require GOOGLE_ADS_DEVELOPER_TOKEN.\n"
-        "See ads/references/mcp-integration.md for setup instructions."
-    )
-
-
-def _run_query(
-    service,
+def _gaql(
     customer_id: str,
     gaql: str,
+    headers: dict,
     label: str,
-    errors: list[dict],
-) -> list:
-    """Execute a GAQL query and return results as a list, recording failures."""
+    errors: list,
+    page_size: int = 10_000,
+) -> list[dict]:
+    """POST a GAQL query; page through results; return list of row dicts."""
+    url = f"{_ADS_API_BASE}/customers/{customer_id}/googleAds:searchStream"
+    rows: list[dict] = []
     try:
-        stream = service.search_stream(customer_id=customer_id, query=gaql)
-        rows = []
-        for batch in stream:
-            for row in batch.results:
-                rows.append(row)
-        return rows
+        resp = requests.post(
+            url,
+            headers=headers,
+            json={"query": gaql},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        # searchStream returns newline-delimited JSON chunks
+        for line in resp.text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            chunk = json.loads(line)
+            rows.extend(chunk.get("results", []))
     except Exception as exc:
         errors.append({"query": label, "error": sanitize_error(exc)})
         log.warning("Query '%s' failed: %s", label, sanitize_error(exc))
-        return []
+    return rows
 
 
-# ── GAQL query builders ───────────────────────────────────────────────────────
+# ── impression-share helper ───────────────────────────────────────────────────
 
-_CAMPAIGN_QUERY = """
+def _is_val(v: Any) -> float | None:
+    """Convert Google's IS value to float or None.
+
+    Google returns 0.0–1.0 floats but also "--" (string) when the metric is
+    below the reporting threshold.
+    """
+    if v is None or v == "--":
+        return None
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return None
+
+
+# ── GAQL strings ──────────────────────────────────────────────────────────────
+
+# Impression share included here — the critical gap in the upstream Express API
+_Q_CAMPAIGNS = """
 SELECT
   campaign.id,
   campaign.name,
@@ -179,10 +199,10 @@ SELECT
   campaign.network_settings.target_content_network,
   campaign.network_settings.target_partner_search_network,
   campaign.geo_target_type_setting.positive_geo_target_type,
-  campaign.geo_target_type_setting.negative_geo_target_type,
   campaign.serving_status,
   campaign.primary_status,
-  campaign.experiment_type,
+  campaign.target_cpa.target_cpa_micros,
+  campaign.target_roas.target_roas,
   metrics.cost_micros,
   metrics.clicks,
   metrics.impressions,
@@ -191,32 +211,20 @@ SELECT
   metrics.cost_per_conversion,
   metrics.ctr,
   metrics.average_cpc,
+  metrics.search_impression_share,
   metrics.search_budget_lost_impression_share,
-  metrics.search_rank_lost_impression_share
+  metrics.search_rank_lost_impression_share,
+  metrics.search_absolute_top_impression_share,
+  metrics.search_top_impression_share,
+  metrics.content_impression_share,
+  metrics.content_budget_lost_impression_share,
+  metrics.content_rank_lost_impression_share
 FROM campaign
 WHERE campaign.status = 'ENABLED'
   AND segments.date DURING LAST_30_DAYS
 """
 
-_CAMPAIGN_SETTINGS_QUERY = """
-SELECT
-  campaign.id,
-  campaign.name,
-  campaign.status,
-  campaign.advertising_channel_type,
-  campaign.bidding_strategy_type,
-  campaign.target_cpa.target_cpa_micros,
-  campaign.target_roas.target_roas,
-  campaign.maximize_conversions.target_cpa_micros,
-  campaign.maximize_conversion_value.target_roas,
-  campaign.labels,
-  bidding_strategy.name,
-  bidding_strategy.type
-FROM campaign
-WHERE campaign.status = 'ENABLED'
-"""
-
-_AD_GROUP_QUERY = """
+_Q_AD_GROUPS = """
 SELECT
   ad_group.id,
   ad_group.name,
@@ -234,8 +242,8 @@ WHERE campaign.status = 'ENABLED'
   AND segments.date DURING LAST_30_DAYS
 """
 
-# No segments.date to avoid per-day row explosion (see gaql-notes.md)
-_KEYWORD_QUERY = """
+# No segments.date — avoids per-day row explosion (gaql-notes.md)
+_Q_KEYWORDS = """
 SELECT
   ad_group_criterion.criterion_id,
   ad_group_criterion.keyword.text,
@@ -245,7 +253,6 @@ SELECT
   ad_group_criterion.quality_info.creative_quality_score,
   ad_group_criterion.quality_info.post_click_quality_score,
   ad_group_criterion.quality_info.search_predicted_ctr,
-  ad_group_criterion.final_urls,
   ad_group_criterion.system_serving_status,
   campaign.id,
   campaign.name,
@@ -255,20 +262,17 @@ SELECT
   metrics.impressions,
   metrics.clicks,
   metrics.cost_micros,
-  metrics.conversions,
-  metrics.average_quality_score
+  metrics.conversions
 FROM keyword_view
 WHERE campaign.status = 'ENABLED'
   AND ad_group.status != 'REMOVED'
   AND ad_group_criterion.status != 'REMOVED'
 """
 
-# LAST_30_DAYS only (LAST_90_DAYS not valid with DURING per gaql-notes.md)
-# Can't filter campaign.status or ad_group.status here (INVALID_ARGUMENT)
-_SEARCH_TERM_QUERY = """
+# Can't filter campaign.status / ad_group.status in search_term_view (INVALID_ARGUMENT)
+_Q_SEARCH_TERMS = """
 SELECT
   search_term_view.search_term,
-  search_term_view.resource_name,
   campaign.id,
   campaign.name,
   ad_group.id,
@@ -285,10 +289,9 @@ ORDER BY metrics.cost_micros DESC
 LIMIT 1000
 """
 
-_RSA_QUERY = """
+_Q_RSAS = """
 SELECT
   ad_group_ad.ad.id,
-  ad_group_ad.ad.name,
   ad_group_ad.ad.type,
   ad_group_ad.ad.responsive_search_ad.headlines,
   ad_group_ad.ad.responsive_search_ad.descriptions,
@@ -297,7 +300,6 @@ SELECT
   ad_group_ad.ad.final_urls,
   ad_group_ad.status,
   ad_group_ad.ad_strength,
-  ad_group_ad.policy_summary.approval_status,
   campaign.id,
   campaign.name,
   ad_group.id,
@@ -314,7 +316,7 @@ WHERE ad_group_ad.ad.type = 'RESPONSIVE_SEARCH_AD'
   AND segments.date DURING LAST_30_DAYS
 """
 
-_CONVERSION_ACTION_QUERY = """
+_Q_CONVERSION_ACTIONS = """
 SELECT
   conversion_action.id,
   conversion_action.name,
@@ -325,16 +327,13 @@ SELECT
   conversion_action.counting_type,
   conversion_action.attribution_model_settings.attribution_model,
   conversion_action.value_settings.default_value,
-  conversion_action.value_settings.always_use_default_value,
-  conversion_action.click_through_lookback_window_days,
-  conversion_action.view_through_lookback_window_days,
   conversion_action.include_in_conversions_metric,
   conversion_action.origin
 FROM conversion_action
 WHERE conversion_action.status != 'REMOVED'
 """
 
-_SHARED_NEG_LIST_QUERY = """
+_Q_SHARED_NEG_LISTS = """
 SELECT
   shared_set.id,
   shared_set.name,
@@ -347,7 +346,7 @@ WHERE shared_set.type = 'NEGATIVE_KEYWORDS'
   AND shared_set.status != 'REMOVED'
 """
 
-_CAMPAIGN_NEG_LIST_QUERY = """
+_Q_CAMPAIGN_NEG_ASSIGNMENTS = """
 SELECT
   campaign_shared_set.campaign,
   campaign_shared_set.shared_set,
@@ -358,19 +357,18 @@ FROM campaign_shared_set
 WHERE campaign_shared_set.status = 'ENABLED'
 """
 
-_CAMPAIGN_NEGATIVE_KW_QUERY = """
+_Q_CAMPAIGN_NEG_KWS = """
 SELECT
   campaign_criterion.campaign,
   campaign_criterion.keyword.text,
   campaign_criterion.keyword.match_type,
-  campaign_criterion.type,
   campaign_criterion.negative
 FROM campaign_criterion
 WHERE campaign_criterion.type = 'KEYWORD'
   AND campaign_criterion.negative = TRUE
 """
 
-_ASSET_GROUP_QUERY = """
+_Q_ASSET_GROUPS = """
 SELECT
   asset_group.id,
   asset_group.name,
@@ -385,34 +383,30 @@ WHERE campaign.advertising_channel_type = 'PERFORMANCE_MAX'
   AND asset_group.status != 'REMOVED'
 """
 
-_ASSET_GROUP_ASSET_QUERY = """
+_Q_ASSET_GROUP_ASSETS = """
 SELECT
   asset_group_asset.asset_group,
   asset_group_asset.field_type,
   asset_group_asset.status,
-  asset.type,
-  asset.name
+  asset.type
 FROM asset_group_asset
 WHERE asset_group_asset.status != 'REMOVED'
 """
 
-_EXTENSION_QUERY = """
+_Q_EXTENSIONS = """
 SELECT
   campaign_extension_setting.campaign,
   campaign_extension_setting.extension_type,
-  campaign_extension_setting.status,
-  campaign_extension_setting.device
+  campaign_extension_setting.status
 FROM campaign_extension_setting
 WHERE campaign_extension_setting.status = 'ENABLED'
 """
 
-_AUDIENCE_QUERY = """
+_Q_AUDIENCES = """
 SELECT
-  campaign_audience_view.resource_name,
   ad_group_criterion.criterion_id,
   ad_group_criterion.type,
   ad_group_criterion.status,
-  ad_group_criterion.bid_modifier,
   campaign.id,
   campaign.name,
   ad_group.id
@@ -421,7 +415,7 @@ WHERE campaign.status = 'ENABLED'
   AND ad_group_criterion.status != 'REMOVED'
 """
 
-_CUSTOMER_MATCH_QUERY = """
+_Q_CUSTOMER_MATCH = """
 SELECT
   user_list.id,
   user_list.name,
@@ -436,181 +430,114 @@ WHERE user_list.type = 'CRM_BASED'
 """
 
 
-# ── serialiser ────────────────────────────────────────────────────────────────
+# ── keyword dedup ─────────────────────────────────────────────────────────────
 
-def _to_dict(proto_obj) -> dict:
-    """Convert a proto-plus message to a plain dict."""
-    from google.protobuf.json_format import MessageToDict  # type: ignore
-    try:
-        return MessageToDict(proto_obj._pb, preserving_proto_field_name=True)
-    except Exception:
-        # Fallback for non-proto objects
-        return {}
-
-
-def _row_to_dict(row) -> dict:
-    """Flatten a GAQL result row to a nested dict."""
-    d = {}
-    for field in ("campaign", "ad_group", "ad_group_criterion", "ad_group_ad",
-                  "search_term_view", "conversion_action", "shared_set",
-                  "campaign_shared_set", "campaign_criterion", "asset_group",
-                  "asset_group_asset", "asset", "campaign_extension_setting",
-                  "ad_group_audience_view", "campaign_audience_view",
-                  "user_list", "bidding_strategy", "metrics",
-                  "campaign_audience_view"):
-        obj = getattr(row, field, None)
-        if obj is not None:
-            d[field] = _to_dict(obj)
-    return d
-
-
-# ── dedup helpers ─────────────────────────────────────────────────────────────
-
-def _dedup_keywords(rows: list) -> list[dict]:
-    """Deduplicate keyword rows by (ad_group_id, keyword_text, match_type).
-
-    The keyword_view + no-date segmentation approach still returns one row per
-    keyword per date when historical slices differ; this ensures unique entries
-    with aggregated metrics per gaql-notes.md.
-    """
+def _dedup_keywords(rows: list[dict]) -> list[dict]:
+    """Deduplicate by (ad_group_id, keyword_text, match_type), sum metrics."""
     seen: dict[tuple, dict] = {}
     for row in rows:
-        d = _row_to_dict(row)
-        crit = d.get("ad_group_criterion", {})
-        kw = crit.get("keyword", {})
-        ag = d.get("ad_group", {})
-        key = (
-            str(ag.get("id", "")),
-            kw.get("text", "").lower(),
-            kw.get("match_type", ""),
-        )
+        ag_id = str(row.get("adGroup", {}).get("id", ""))
+        kw = row.get("adGroupCriterion", {}).get("keyword", {})
+        key = (ag_id, kw.get("text", "").lower(), kw.get("matchType", ""))
         if key not in seen:
-            seen[key] = d
+            seen[key] = row
         else:
-            # Aggregate numeric metrics
-            existing_m = seen[key].get("metrics", {})
-            new_m = d.get("metrics", {})
-            for metric in ("impressions", "clicks", "cost_micros", "conversions",
-                           "all_conversions"):
-                existing_m[metric] = (
-                    existing_m.get(metric, 0) + new_m.get(metric, 0)
-                )
-            seen[key]["metrics"] = existing_m
+            em = seen[key].setdefault("metrics", {})
+            nm = row.get("metrics", {})
+            for m in ("impressions", "clicks", "costMicros", "conversions"):
+                em[m] = em.get(m, 0) + _to_num(nm.get(m, 0))
     return list(seen.values())
+
+
+def _to_num(v: Any) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# ── asset group asset count ───────────────────────────────────────────────────
+
+def _count_assets(asset_rows: list[dict]) -> dict[str, dict[str, int]]:
+    """Return {asset_group_resource: {field_type: count}}."""
+    counts: dict[str, dict[str, int]] = {}
+    for row in asset_rows:
+        aga = row.get("assetGroupAsset", {})
+        ag_res = aga.get("assetGroup", "")
+        ft = aga.get("fieldType", "")
+        counts.setdefault(ag_res, {})
+        counts[ag_res][ft] = counts[ag_res].get(ft, 0) + 1
+    return counts
+
+
+# ── impression share normalisation ───────────────────────────────────────────
+
+def _normalise_is(campaigns: list[dict]) -> list[dict]:
+    """Convert IS float values and "--" strings to float|None in each row."""
+    is_fields = [
+        "searchImpressionShare",
+        "searchBudgetLostImpressionShare",
+        "searchRankLostImpressionShare",
+        "searchAbsoluteTopImpressionShare",
+        "searchTopImpressionShare",
+        "contentImpressionShare",
+        "contentBudgetLostImpressionShare",
+        "contentRankLostImpressionShare",
+    ]
+    for row in campaigns:
+        m = row.get("metrics", {})
+        for f in is_fields:
+            if f in m:
+                m[f] = _is_val(m[f])
+    return campaigns
 
 
 # ── main fetch ────────────────────────────────────────────────────────────────
 
 def fetch(customer_id: str) -> dict:
-    """Fetch all audit data for *customer_id* and return as a plain dict."""
-    customer_id = _normalise_customer_id(customer_id)
-    client = _build_client()
-    service = client.get_service("GoogleAdsService")
+    customer_id = _normalise_id(customer_id)
+    manager_id = _normalise_id(
+        os.environ.get("GOOGLE_ADS_MANAGER_CUSTOMER_ID", "")
+    ) or None
 
+    token = _get_access_token()
+    headers = _build_headers(token, manager_id)
     errors: list[dict] = []
     ts = datetime.now(timezone.utc).isoformat()
 
-    def q(gaql: str, label: str) -> list:
-        return _run_query(service, customer_id, gaql, label, errors)
+    def q(gaql: str, label: str) -> list[dict]:
+        return _gaql(customer_id, gaql, headers, label, errors)
 
-    # ── campaigns ─────────────────────────────────────────────────────────
-    raw_campaigns = q(_CAMPAIGN_QUERY, "campaigns_metrics")
-    raw_campaign_settings = q(_CAMPAIGN_SETTINGS_QUERY, "campaigns_settings")
+    campaigns = _normalise_is(q(_Q_CAMPAIGNS, "campaigns"))
+    ad_groups = q(_Q_AD_GROUPS, "ad_groups")
+    keywords = _dedup_keywords(q(_Q_KEYWORDS, "keywords"))
+    search_terms = q(_Q_SEARCH_TERMS, "search_terms")
+    ads = q(_Q_RSAS, "rsa_ads")
+    conversion_actions = q(_Q_CONVERSION_ACTIONS, "conversion_actions")
+    shared_neg_lists = q(_Q_SHARED_NEG_LISTS, "shared_neg_lists")
+    campaign_neg_assignments = q(_Q_CAMPAIGN_NEG_ASSIGNMENTS, "campaign_neg_assignments")
+    campaign_neg_kws = q(_Q_CAMPAIGN_NEG_KWS, "campaign_neg_keywords")
+    asset_groups_raw = q(_Q_ASSET_GROUPS, "asset_groups")
+    asset_rows = q(_Q_ASSET_GROUP_ASSETS, "asset_group_assets")
+    extensions = q(_Q_EXTENSIONS, "extensions")
+    audiences = q(_Q_AUDIENCES, "audiences")
+    customer_match = q(_Q_CUSTOMER_MATCH, "customer_match")
 
-    # Merge settings into campaign objects
-    settings_by_id: dict[str, dict] = {}
-    for row in raw_campaign_settings:
-        d = _row_to_dict(row)
-        cid = str(d.get("campaign", {}).get("id", ""))
-        if cid:
-            settings_by_id[cid] = d
-
-    campaigns = []
-    for row in raw_campaigns:
-        d = _row_to_dict(row)
-        cid = str(d.get("campaign", {}).get("id", ""))
-        if cid in settings_by_id:
-            # Merge bidding strategy and target info from settings query
-            extra = settings_by_id[cid]
-            d["campaign"].update({
-                k: v for k, v in extra.get("campaign", {}).items()
-                if k not in d.get("campaign", {})
-            })
-        campaigns.append(d)
-
-    # ── ad groups ─────────────────────────────────────────────────────────
-    ad_groups = [_row_to_dict(r) for r in q(_AD_GROUP_QUERY, "ad_groups")]
-
-    # ── keywords (deduplicated) ────────────────────────────────────────────
-    keywords = _dedup_keywords(q(_KEYWORD_QUERY, "keywords"))
-
-    # ── search terms (filter removed in app layer per gaql-notes.md) ──────
-    raw_st = q(_SEARCH_TERM_QUERY, "search_terms")
-    search_terms = [_row_to_dict(r) for r in raw_st]
-
-    # ── RSAs ──────────────────────────────────────────────────────────────
-    ads = [_row_to_dict(r) for r in q(_RSA_QUERY, "rsa_ads")]
-
-    # ── conversion actions ────────────────────────────────────────────────
-    conversion_actions = [
-        _row_to_dict(r) for r in q(_CONVERSION_ACTION_QUERY, "conversion_actions")
-    ]
-
-    # ── shared negative lists ──────────────────────────────────────────────
-    shared_neg_lists = [
-        _row_to_dict(r) for r in q(_SHARED_NEG_LIST_QUERY, "shared_neg_lists")
-    ]
-    campaign_neg_assignments = [
-        _row_to_dict(r) for r in q(_CAMPAIGN_NEG_LIST_QUERY, "campaign_neg_list_assignments")
-    ]
-    campaign_neg_kws = [
-        _row_to_dict(r) for r in q(_CAMPAIGN_NEGATIVE_KW_QUERY, "campaign_neg_keywords")
-    ]
-
-    # ── PMax asset groups ──────────────────────────────────────────────────
-    raw_asset_groups = q(_ASSET_GROUP_QUERY, "asset_groups")
-    raw_assets = q(_ASSET_GROUP_ASSET_QUERY, "asset_group_assets")
-
-    # Count assets per asset_group by field_type
-    asset_counts: dict[str, dict[str, int]] = {}
-    for row in raw_assets:
-        d = _row_to_dict(row)
-        ag_resource = d.get("asset_group_asset", {}).get("asset_group", "")
-        field_type = d.get("asset_group_asset", {}).get("field_type", "")
-        if ag_resource not in asset_counts:
-            asset_counts[ag_resource] = {}
-        asset_counts[ag_resource][field_type] = (
-            asset_counts[ag_resource].get(field_type, 0) + 1
-        )
-
-    asset_groups = []
-    for row in raw_asset_groups:
-        d = _row_to_dict(row)
-        ag = d.get("asset_group", {})
-        resource = ag.get("resource_name", "")
-        d["asset_counts"] = asset_counts.get(resource, {})
-        asset_groups.append(d)
-
-    # ── extensions ────────────────────────────────────────────────────────
-    extensions = [
-        _row_to_dict(r) for r in q(_EXTENSION_QUERY, "extensions")
-    ]
-
-    # ── audience signals ──────────────────────────────────────────────────
-    audiences = [
-        _row_to_dict(r) for r in q(_AUDIENCE_QUERY, "audiences")
-    ]
-
-    # ── customer match lists ───────────────────────────────────────────────
-    customer_match = [
-        _row_to_dict(r) for r in q(_CUSTOMER_MATCH_QUERY, "customer_match")
+    asset_counts = _count_assets(asset_rows)
+    asset_groups = [
+        {**row, "assetCounts": asset_counts.get(
+            row.get("assetGroup", {}).get("resourceName", ""), {}
+        )}
+        for row in asset_groups_raw
     ]
 
     return {
         "meta": {
             "fetched_at": ts,
             "customer_id": customer_id,
+            "manager_id": manager_id,
             "date_range": "LAST_30_DAYS",
+            "api_version": "v20",
             "total_errors": len(errors),
         },
         "campaigns": campaigns,
@@ -634,62 +561,42 @@ def fetch(customer_id: str) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Fetch Google Ads account data for audit analysis.",
+        description="Fetch Google Ads account data (REST API v20, service account auth).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     parser.add_argument(
         "--customer-id",
         default=os.environ.get("GOOGLE_ADS_CUSTOMER_ID", ""),
-        help="Google Ads customer ID (dashes optional). "
-             "Default: $GOOGLE_ADS_CUSTOMER_ID",
+        help="Google Ads customer ID (dashes optional). Default: $GOOGLE_ADS_CUSTOMER_ID",
     )
     parser.add_argument(
-        "--output",
-        default="-",
+        "--output", default="-",
         help="Output file path. Use '-' for stdout (default).",
     )
     parser.add_argument(
-        "--check-auth",
-        action="store_true",
-        help="Verify credentials and print the auth method; do not fetch data.",
-    )
-    parser.add_argument(
-        "--pretty",
-        action="store_true",
-        default=True,
-        help="Pretty-print JSON output (default: true).",
+        "--check-auth", action="store_true",
+        help="Verify credentials only; do not fetch data.",
     )
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.WARNING,
-        format="%(levelname)s: %(message)s",
-        stream=sys.stderr,
-    )
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s",
+                        stream=sys.stderr)
 
     if args.check_auth:
         try:
-            client = _build_client()
-            # Determine which method was used
-            if os.environ.get("GOOGLE_ADS_REFRESH_TOKEN"):
-                method = "OAuth2"
-            else:
-                method = "Service account"
-            print(json.dumps({"status": "ok", "auth_method": method}))
-        except RuntimeError as exc:
+            _get_access_token()
+            print(json.dumps({"status": "ok", "auth_method": "service_account"}))
+        except Exception as exc:
             print(json.dumps({"status": "error", "message": str(exc)}), file=sys.stderr)
             sys.exit(1)
         return
 
     if not args.customer_id:
-        print(
-            json.dumps({
-                "error": "customer_id required",
-                "hint": "Set GOOGLE_ADS_CUSTOMER_ID or pass --customer-id",
-            }),
-            file=sys.stderr,
-        )
+        print(json.dumps({
+            "error": "customer_id required",
+            "hint": "Set GOOGLE_ADS_CUSTOMER_ID or pass --customer-id",
+        }), file=sys.stderr)
         sys.exit(1)
 
     try:
@@ -698,24 +605,20 @@ def main() -> None:
         print(json.dumps({"error": sanitize_error(exc)}), file=sys.stderr)
         sys.exit(1)
 
-    indent = 2 if args.pretty else None
-    output = json.dumps(data, indent=indent, default=str)
-
+    output = json.dumps(data, indent=2, default=str)
     if args.output == "-":
         print(output)
     else:
         with open(args.output, "w", encoding="utf-8") as fh:
             fh.write(output)
-        print(
-            json.dumps({
-                "status": "ok",
-                "file": args.output,
-                "campaigns": len(data.get("campaigns", [])),
-                "keywords": len(data.get("keywords", [])),
-                "search_terms": len(data.get("search_terms", [])),
-                "errors": len(data.get("data_errors", [])),
-            })
-        )
+        print(json.dumps({
+            "status": "ok",
+            "file": args.output,
+            "campaigns": len(data.get("campaigns", [])),
+            "keywords": len(data.get("keywords", [])),
+            "search_terms": len(data.get("search_terms", [])),
+            "errors": len(data.get("data_errors", [])),
+        }))
 
 
 if __name__ == "__main__":
