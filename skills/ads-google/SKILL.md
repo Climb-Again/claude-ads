@@ -10,7 +10,39 @@ tested_with: claude-code v2.x
 
 ## Process
 
-1. Collect Google Ads account data (export, Change History, Search Terms Report)
+### Step 1 — Data Collection (choose one path)
+
+**Path A — Live API (preferred when credentials are available):**
+
+Check whether `GOOGLE_ADS_DEVELOPER_TOKEN` is set AND at least one auth method
+is configured (`GOOGLE_ADS_REFRESH_TOKEN` for OAuth2, or
+`GOOGLE_APPLICATION_CREDENTIALS` for service account).
+
+If both conditions are met, run:
+```bash
+python scripts/fetch_google_ads.py \
+  --customer-id "$GOOGLE_ADS_CUSTOMER_ID" \
+  --output google-ads-data.json
+```
+
+Then parse `google-ads-data.json`. The file contains:
+`campaigns`, `ad_groups`, `keywords` (deduplicated), `search_terms`,
+`ads`, `conversion_actions`, `shared_negative_lists`,
+`campaign_neg_list_assignments`, `campaign_negative_keywords`,
+`asset_groups` (with `asset_counts`), `extensions`, `audiences`,
+`customer_match_lists`, `data_errors`.
+
+If `data_errors` is non-empty, note which checks are skipped and why.
+
+**Path B — Manual exports (fallback when API is unavailable):**
+
+Ask the user to provide:
+- Google Ads export (CSV or copy-paste from UI)
+- Search Terms Report (last 30 days)
+- Change History (optional, for G-AD1 freshness check)
+
+### Steps 2–9
+
 2. **Validate**: confirm data covers ≥30 days and includes Search Terms Report before proceeding
 3. Read `ads/references/google-audit.md` for full 80-check audit
 4. Read `ads/references/benchmarks.md` for Google-specific benchmarks
@@ -95,17 +127,32 @@ deduplication patterns, and filter scope best practices. Key rules:
 - Only flag wasted spend on terms with >$10 spend AND 0 conversions (G16)
 - Count shared negative keyword lists alongside campaign-level negatives (G14/G15)
 
-## Google Ads MCP Integration (Optional)
+## Live API Integration
 
-For automated data collection, connect the [Google Ads MCP server](https://github.com/googleads/google-ads-mcp):
+The `scripts/fetch_google_ads.py` script fetches all audit data via the
+Google Ads Python library (no MCP server required).
 
-- **Tools available**: `search` (GAQL queries), `list_accessible_customers`
-- **Setup**: Configure in `.mcp.json` or Claude Code MCP settings
-- **Customer ID**: Extract from CLAUDE.md under Accounts > Google Ads, or ask the user
-- **Fallback**: If MCP is not configured, fall back to manual data export (the default workflow)
+**Required env vars:**
+```
+GOOGLE_ADS_DEVELOPER_TOKEN=...
+GOOGLE_ADS_CUSTOMER_ID=191-261-1776          # or --customer-id flag
+GOOGLE_ADS_LOGIN_CUSTOMER_ID=1234567890      # MCC/manager account (digits only)
 
-When MCP is available, use it to pull Search Terms Reports, keyword data, conversion actions,
-and campaign structure automatically instead of requiring manual exports.
+# Auth — pick one:
+GOOGLE_ADS_CLIENT_ID=...                     # OAuth2
+GOOGLE_ADS_CLIENT_SECRET=...
+GOOGLE_ADS_REFRESH_TOKEN=...
+
+GOOGLE_APPLICATION_CREDENTIALS=/path/key.json  # Service account
+```
+
+**Auth setup:**
+- OAuth2: use `google-ads-python` CLI to generate a refresh token, or follow
+  the guide at `ads/references/mcp-integration.md`
+- Service account: download the JSON key from GCP → IAM & Admin →
+  Service Accounts, then set `GOOGLE_APPLICATION_CREDENTIALS`
+
+**Verify auth:** `python scripts/fetch_google_ads.py --check-auth`
 
 ## PMax Deep Dive
 

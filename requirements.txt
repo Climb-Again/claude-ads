@@ -2,6 +2,11 @@
 # Bounded version pinning with security-conscious minimums
 # Last updated: April 1, 2026
 
+# Google Ads API (used by fetch_google_ads.py for live account data)
+# Auth: set GOOGLE_ADS_DEVELOPER_TOKEN + GOOGLE_ADS_REFRESH_TOKEN (OAuth2)
+#       or GOOGLE_APPLICATION_CREDENTIALS (service account JSON key)
+google-ads>=24.0.0,<26.0.0
+
 # Core dependencies (landing page analysis, brand screenshots)
 requests>=2.32.4,<3.0.0           # CVE-2024-47081, CVE-2024-35195 fixes
 playwright>=1.56.0,<2.0.0         # CVE-2025-59288 fix (macOS); used by ads-dna screenshots
