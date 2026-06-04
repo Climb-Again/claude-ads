@@ -6,7 +6,7 @@ A beep and white flash mark each 5-second transition.
 Bold centered numerals with strong contrast throughout.
 
 Usage:
-    python generate_countdown.py [--output countdown_60s.mp4] [--width 1920] [--height 1080]
+    python generate_countdown.py [--output countdown_60s.mp4] [--width 1080] [--height 1920]
 
 Output:
     JSON summary on stdout, video file at --output path.
@@ -76,11 +76,16 @@ def build_countdown(width: int, height: int) -> CompositeVideoClip:
             .with_start(start)
         )
 
-        # Number label — larger on transition seconds for a "pulse" feel
+        # Number label — larger on transition seconds for a "pulse" feel.
+        # Use a fixed canvas size (never smaller than the glyph) to prevent
+        # tight cropping that clips ascenders/descenders.
         font_size = 560 if is_transition else 500
+        canvas = (int(width * 0.9), int(font_size * 1.4))
         txt = (
             TextClip(font=FONT, text=str(countdown), font_size=font_size,
-                     color="white", method="label")
+                     color="white", size=canvas,
+                     method="caption", text_align="center",
+                     horizontal_align="center", vertical_align="center")
             .with_position("center")
             .with_duration(1)
             .with_start(start)
@@ -109,8 +114,8 @@ def build_countdown(width: int, height: int) -> CompositeVideoClip:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate a 60-second countdown video.")
     parser.add_argument("--output", default="countdown_60s.mp4")
-    parser.add_argument("--width", type=int, default=1920)
-    parser.add_argument("--height", type=int, default=1080)
+    parser.add_argument("--width", type=int, default=1080)
+    parser.add_argument("--height", type=int, default=1920)
     args = parser.parse_args()
 
     print(json.dumps({"status": "building", "output": args.output,
