@@ -122,6 +122,7 @@ def main() -> None:
         fps=30,
         codec="libx264",
         audio_codec="aac",
+        ffmpeg_params=["-movflags", "+faststart"],
         logger="bar",
     )
 
