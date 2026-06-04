@@ -18,9 +18,15 @@ import sys
 import numpy as np
 
 try:
-    from moviepy.editor import (
-        ColorClip, TextClip, CompositeVideoClip, AudioArrayClip, concatenate_audioclips
-    )
+    try:
+        from moviepy.editor import (
+            ColorClip, TextClip, CompositeVideoClip, AudioArrayClip,
+        )
+    except ModuleNotFoundError:
+        # moviepy 2.x removed the .editor shim
+        from moviepy import (
+            ColorClip, TextClip, CompositeVideoClip, AudioArrayClip,
+        )
 except ImportError:
     print(json.dumps({"error": "moviepy not installed. Run: pip install moviepy"}))
     sys.exit(1)
@@ -32,7 +38,7 @@ COLORS = [
     "#5b21b6", "#134e4a", "#9a3412", "#1e1b4b",
     "#7f1d1d", "#854d0e", "#334155", "#1a1a2e",
 ]
-FONT = "Arial-Bold"
+FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 
 def hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
@@ -50,7 +56,7 @@ def make_beep(duration: float = 0.12, freq: float = 880, fade: float = 0.02) -> 
     fade_samples = int(fade * sample_rate)
     wave[-fade_samples:] *= np.linspace(1, 0, fade_samples)
     stereo = np.column_stack([wave, wave]).astype(np.float32)
-    return AudioArrayClip(stereo, fps=sample_rate).set_duration(duration)
+    return AudioArrayClip(stereo, fps=sample_rate).with_duration(duration)
 
 
 def build_countdown(width: int, height: int) -> CompositeVideoClip:
@@ -66,18 +72,18 @@ def build_countdown(width: int, height: int) -> CompositeVideoClip:
         # Background
         bg = (
             ColorClip(size=(width, height), color=bg_rgb)
-            .set_duration(1)
-            .set_start(start)
+            .with_duration(1)
+            .with_start(start)
         )
 
         # Number label — larger on transition seconds for a "pulse" feel
         font_size = 560 if is_transition else 500
         txt = (
-            TextClip(str(countdown), fontsize=font_size, color="white",
-                     font=FONT, method="label")
-            .set_position("center")
-            .set_duration(1)
-            .set_start(start)
+            TextClip(font=FONT, text=str(countdown), font_size=font_size,
+                     color="white", method="label")
+            .with_position("center")
+            .with_duration(1)
+            .with_start(start)
         )
 
         clips.append(bg)
@@ -87,15 +93,15 @@ def build_countdown(width: int, height: int) -> CompositeVideoClip:
             # Brief white flash overlay (0.12 s)
             flash = (
                 ColorClip(size=(width, height), color=(255, 255, 255))
-                .set_opacity(0.25)
-                .set_duration(0.12)
-                .set_start(start)
+                .with_opacity(0.25)
+                .with_duration(0.12)
+                .with_start(start)
             )
             clips.append(flash)
 
             # Beep attached to the text clip at this second
-            txt = txt.set_audio(beep.set_start(start))
-            clips[-1] = txt   # replace the txt we just appended
+            txt = txt.with_audio(beep.with_start(start))
+            clips[-2] = txt   # replace the txt (index -2; flash is -1)
 
     return CompositeVideoClip(clips, size=(width, height))
 
