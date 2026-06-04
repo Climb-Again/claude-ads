@@ -3,12 +3,12 @@ generate_countdown.py — Create a 60-second countdown timer video.
 
 Full-screen background cycles through 12 colors every 5 seconds.
 A beep and white flash mark each 5-second transition.
-Bold centered numerals with strong contrast throughout.
-Optional logo (top-left) and title (top-center) overlays.
+Layout: logo large centered in top half, "Wall Crawls" title below logo,
+        big countdown number in bottom half.
 
 Usage:
     python generate_countdown.py [--output countdown_60s.mp4] [--width 1920] [--height 1080]
-                                 [--logo assets/logo.png] [--title "Wall Crawls"]
+                                 [--logo assets/logo_white.png] [--title "Wall Crawls"]
 
 Output:
     JSON summary on stdout, video file at --output path.
@@ -41,7 +41,6 @@ COLORS = [
     "#7f1d1d", "#854d0e", "#334155", "#1a1a2e",
 ]
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-MARGIN = 40  # px from edges for logo / title
 
 
 def hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
@@ -61,44 +60,49 @@ def make_beep(duration: float = 0.12, freq: float = 880, fade: float = 0.02) -> 
     return AudioArrayClip(stereo, fps=sample_rate).with_duration(duration)
 
 
-def make_logo_clip(logo_path: str, height: int, duration: int) -> ImageClip:
-    """Load logo, scale to logo_height, pin to top-left with margin."""
-    logo_h = int(height * 0.10)  # 10% of frame height
+def make_logo_clip(logo_path: str, width: int, height: int, duration: int) -> ImageClip:
+    """Logo scaled to fill ~40% of frame width, centered in top 45% of frame."""
     from PIL import Image
     img = Image.open(logo_path).convert("RGBA")
-    aspect = img.width / img.height
-    img = img.resize((int(logo_h * aspect), logo_h), Image.LANCZOS)
-
-    # Composite onto transparent background to preserve alpha
+    target_w = int(width * 0.42)
+    target_h = int(target_w * img.height / img.width)
+    img = img.resize((target_w, target_h), Image.LANCZOS)
     arr = np.array(img)
-    clip = (
+    # Center horizontally; vertically centered in top 45% zone
+    zone_h = int(height * 0.45)
+    x = (width - target_w) // 2
+    y = (zone_h - target_h) // 2
+    return (
         ImageClip(arr, is_mask=False)
         .with_duration(duration)
-        .with_position((MARGIN, MARGIN))
+        .with_position((x, y))
     )
-    return clip
 
 
 def make_title_clip(title: str, width: int, height: int, duration: int) -> TextClip:
-    """Render title text, centered horizontally at the top."""
-    font_size = max(40, int(height * 0.055))
-    canvas_w = int(width * 0.6)
-    canvas_h = int(font_size * 1.6)
-    clip = (
+    """Title text centered just below the logo zone."""
+    font_size = int(height * 0.07)
+    canvas_w = int(width * 0.8)
+    canvas_h = int(font_size * 1.5)
+    y = int(height * 0.47)  # just below logo zone
+    return (
         TextClip(font=FONT, text=title, font_size=font_size,
                  color="white", size=(canvas_w, canvas_h),
                  method="caption", text_align="center",
                  horizontal_align="center", vertical_align="center")
         .with_duration(duration)
-        .with_position(("center", MARGIN))
+        .with_position(("center", y))
     )
-    return clip
 
 
 def build_countdown(width: int, height: int,
                     logo_path: str | None, title: str | None) -> CompositeVideoClip:
     clips = []
     beep = make_beep()
+
+    # Number sits in bottom 45% of frame, centered in that zone
+    num_zone_top = int(height * 0.55)
+    num_zone_h = height - num_zone_top
 
     for countdown in range(DURATION, 0, -1):
         start = DURATION - countdown
@@ -112,16 +116,15 @@ def build_countdown(width: int, height: int,
             .with_start(start)
         )
 
-        font_size = 560 if is_transition else 500
-        # Scale number font to frame height so it works at any resolution
-        font_size = int(height * (font_size / 1080))
-        canvas = (int(width * 0.7), int(font_size * 1.4))
+        font_size = int(num_zone_h * (0.92 if is_transition else 0.82))
+        canvas = (int(width * 0.7), int(font_size * 1.3))
+        num_y = num_zone_top + (num_zone_h - int(font_size * 1.3)) // 2
         txt = (
             TextClip(font=FONT, text=str(countdown), font_size=font_size,
                      color="white", size=canvas,
                      method="caption", text_align="center",
                      horizontal_align="center", vertical_align="center")
-            .with_position("center")
+            .with_position(("center", max(num_zone_top, num_y)))
             .with_duration(1)
             .with_start(start)
         )
@@ -140,9 +143,8 @@ def build_countdown(width: int, height: int,
             txt = txt.with_audio(beep.with_start(start))
             clips[-2] = txt  # replace txt (flash is at -1)
 
-    # Logo and title sit on top of everything, spanning full duration
     if logo_path and os.path.exists(logo_path):
-        clips.append(make_logo_clip(logo_path, height, DURATION))
+        clips.append(make_logo_clip(logo_path, width, height, DURATION))
     if title:
         clips.append(make_title_clip(title, width, height, DURATION))
 
@@ -154,8 +156,8 @@ def main() -> None:
     parser.add_argument("--output", default="countdown_60s.mp4")
     parser.add_argument("--width", type=int, default=1920)
     parser.add_argument("--height", type=int, default=1080)
-    parser.add_argument("--logo", default=None, help="Path to logo PNG (transparent background)")
-    parser.add_argument("--title", default=None, help="Title text shown at top-center")
+    parser.add_argument("--logo", default=None, help="Path to logo PNG (white-on-transparent)")
+    parser.add_argument("--title", default=None, help="Title text shown below logo")
     args = parser.parse_args()
 
     print(json.dumps({"status": "building", "output": args.output,
