@@ -110,3 +110,8 @@ assets/diagrams/02-pipeline-B.svg
 assets/diagrams/05-roadmap-B.svg
 !assets/diagrams/02-pipeline-A.svg
 !assets/diagrams/05-roadmap-A.svg
+
+# Generated video files
+countdown_*.mp4
+ad-assets/
+*.mp4
