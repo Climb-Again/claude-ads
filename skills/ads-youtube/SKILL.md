@@ -12,6 +12,13 @@ tested_with: claude-code v2.x
 
 ## Process
 
+> **Sharing video files for analysis**
+> Videos can be shared via direct upload or Google Drive link. For Google Drive:
+> 1. Right-click the file → **Share** → change access from "Restricted" to **"Anyone with the link"** (Viewer)
+> 2. Copy the share link — it looks like `https://drive.google.com/file/d/FILE_ID/view?usp=sharing`
+> 3. Paste that link here. Claude will fetch and analyze the video directly.
+> 4. If the link was previously set to Restricted, you may need to wait ~30s after changing permissions before it becomes accessible.
+
 1. Collect YouTube Ads data (Google Ads export filtered to Video campaigns)
 2. Read `ads/references/google-audit.md` for YouTube-relevant checks (incl. G-DG1 through G-DG3, G-CTV1)
 3. Read `ads/references/platform-specs.md` for video specifications
